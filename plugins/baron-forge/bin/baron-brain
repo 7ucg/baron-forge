@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# baron-brain — per-project knowledge map manager.
+# Reads/injects .baron-brain.md from the git root of the current project.
+set -uo pipefail
+
+PY=""; for c in python3 python py; do if "$c" -c '' >/dev/null 2>&1; then PY="$c"; break; fi; done
+[ -n "$PY" ] || exit 0
+
+find_root() {
+    git rev-parse --show-toplevel 2>/dev/null || echo "$PWD"
+}
+
+cmd="${1:-show}"; shift || true
+
+case "$cmd" in
+  show|cat)
+    brain="$(find_root)/.baron-brain.md"
+    [ -f "$brain" ] || { echo "no brain at $brain — run /brain to build one" >&2; exit 1; }
+    cat "$brain"
+    ;;
+  path)
+    echo "$(find_root)/.baron-brain.md"
+    ;;
+  hook-inject)
+    # SessionStart: inject the project brain if one exists in the current git repo.
+    root="$(find_root 2>/dev/null || true)"
+    [ -n "$root" ] || exit 0
+    brain="$root/.baron-brain.md"
+    [ -f "$brain" ] || exit 0
+    "$PY" - "$brain" "$root/.baron-brain-stale" <<'PYEOF'
+import json, sys, os, time
+brain_file, stale_marker = sys.argv[1], sys.argv[2]
+try:
+    content = open(brain_file, encoding='utf-8').read()
+    age_days = (time.time() - os.path.getmtime(brain_file)) / 86400
+    if os.path.exists(stale_marker):
+        note = "\n[brain stale: project config changed — run /brain to rebuild]"
+    elif age_days > 7:
+        note = f"\n[brain is {int(age_days)}d old — run /brain to rebuild]"
+    else:
+        note = ""
+    ctx = f"<baron_brain>\n{content}{note}\n</baron_brain>"
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}}))
+except Exception:
+    pass
+PYEOF
+    ;;
+  *)
+    printf 'baron-brain <show|path|hook-inject>\n' >&2
+    exit 1
+    ;;
+esac

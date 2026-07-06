@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# baron-doctor — self-check the baron-forge plugin. Validates skill/agent frontmatter,
+# hooks.json, referenced bin paths, and executable bits. Exits non-zero on any FAIL.
+set -uo pipefail
+PY=""; for c in python3 python py; do if "$c" -c '' >/dev/null 2>&1; then PY="$c"; break; fi; done
+[ -n "$PY" ] || { echo "FAIL: no working python"; exit 1; }
+
+ROOT="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
+cd "$ROOT" || { echo "FAIL: plugin root not found"; exit 1; }
+fail=0; ok=0
+pass(){ ok=$((ok+1)); }
+bad(){ echo "FAIL: $1"; fail=$((fail+1)); }
+
+has_fm(){  # file has --- frontmatter with name: and description:
+  "$PY" - "$1" <<'PYEOF'
+import sys,re
+t=open(sys.argv[1],encoding="utf-8",errors="replace").read()
+m=re.match(r'^---\s*\n(.*?)\n---', t, re.S)
+sys.exit(0 if (m and re.search(r'^name:',m.group(1),re.M) and re.search(r'^description:',m.group(1),re.M)) else 1)
+PYEOF
+}
+
+echo "== skills =="
+for f in skills/*/SKILL.md; do
+  if has_fm "$f"; then pass; else bad "$f missing name/description frontmatter"; fi
+done
+echo "== agents =="
+for f in agents/*.md; do
+  if has_fm "$f"; then pass; else bad "$f missing name/description frontmatter"; fi
+done
+echo "== plugin.json / hooks.json valid =="
+"$PY" -c "import json;json.load(open('.claude-plugin/plugin.json'))" 2>/dev/null && pass || bad "plugin.json invalid JSON"
+"$PY" -c "import json;json.load(open('hooks/hooks.json'))" 2>/dev/null && pass || bad "hooks.json invalid JSON"
+
+echo "== hook commands point to existing bins + executable =="
+bins=$("$PY" - <<'PYEOF' | tr -d '\r'
+import re
+t=open("hooks/hooks.json").read()
+print("\n".join(sorted(set(re.findall(r'bin/([A-Za-z0-9_-]+)', t)))))
+PYEOF
+)
+for b in $bins; do
+  if [ -f "bin/$b" ]; then
+    [ -x "bin/$b" ] && pass || bad "bin/$b not executable (chmod +x)"
+  else bad "hooks.json references missing bin/$b"; fi
+done
+
+echo "== bin scripts executable =="
+for f in bin/*; do [ -x "$f" ] && pass || bad "$f not executable"; done
+
+echo "---"
+echo "checks passed: $ok | failed: $fail"
+[ "$fail" -eq 0 ] && echo "baron-forge: HEALTHY" || echo "baron-forge: $fail PROBLEM(S)"
+exit "$fail"

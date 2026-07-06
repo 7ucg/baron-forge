@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# baron-bash-check — PostToolUse(Bash) hook. Detects common failure signatures in
+# the command output and feeds back ONE terse fix hint. Silent on success or when
+# nothing matches. Never echoes the output back (Claude already has it) -> low token.
+#
+# Fast path: scan raw JSON input directly instead of Python JSON parsing.
+# Error strings appear verbatim in JSON-encoded output; this covers all common cases
+# with zero Python startup overhead. Python is only spawned to emit the hint JSON.
+set -uo pipefail
+
+input="$(cat)"
+[ -n "$input" ] || exit 0
+
+_FAIL_FLAG="${BARON_FORGE_HOME:-$HOME/.claude/baron-forge}/session-had-failure"
+
+hint=""
+case "$input" in
+  *"command not found"*|*"not recognized as"*|*": not found"*)
+    hint="binary missing/not on PATH -> install it or use full path (command -v <tool>)" ;;
+  *"Cannot find module"*|*"MODULE_NOT_FOUND"*|*"ERR_MODULE_NOT_FOUND"*)
+    hint="missing node dep -> npm/pnpm install (or fix the import path)" ;;
+  *"ENOENT"*|*"No such file or directory"*)
+    hint="path wrong / file absent -> check cwd + exact path (Windows backslashes?)" ;;
+  *"Permission denied"*|*"EACCES"*|*"Operation not permitted"*)
+    hint="perms -> chmod +x / run from a writable dir / elevate if truly needed" ;;
+  *"EADDRINUSE"*|*"address already in use"*)
+    hint="port busy -> kill the holder or change port" ;;
+  *"error[E"*|*"error: aborting due to"*|*"could not compile"*)
+    hint="rust compile error -> read the first error[..] only; later ones often cascade" ;;
+  *"test result: FAILED"*)
+    hint="cargo test failed -> read the FAILED test name; run with -- --nocapture for println output" ;;
+  *"thread '"*"' panicked"*)
+    hint="rust panic -> RUST_BACKTRACE=1 for full trace; check the line cited in the backtrace" ;;
+  *"Traceback (most recent call last)"*)
+    hint="python exception -> fix from the bottom-most frame (the actual raise)" ;;
+  *"npm ERR!"*)
+    hint="npm failure -> check the npm-debug log line; often peer-dep/version or registry" ;;
+  *": error TS"*)
+    hint="ts type error -> fix at the cited file:line; don't @ts-ignore unless intentional" ;;
+  *"fatal: not a git repository"*)
+    hint="not a git repo -> git init or cd into the right repo" ;;
+  *"CONFLICT"*|*"Merge conflict"*)
+    hint="git conflict -> resolve before continuing" ;;
+  *) ;;
+esac
+
+# Track failure state and emit memory-save hint on recovery.
+if [ -n "$hint" ]; then
+    # Mark that a failure occurred this session.
+    touch "$_FAIL_FLAG" 2>/dev/null || true
+elif [ -f "$_FAIL_FLAG" ]; then
+    # Previous failure existed — check if current command succeeded.
+    case "$input" in
+      *"test result: ok"*|*"Finished release"*|*"Finished dev"*|\
+      *"All tests passed"*|*" 0 failed"*|*"Tests:   0 failed"*|\
+      *"passing"*|*"Build succeeded"*)
+        hint="✓ green after a failure — baron-mem save to preserve what fixed it"
+        rm -f "$_FAIL_FLAG" 2>/dev/null || true
+        ;;
+    esac
+fi
+
+[ -n "$hint" ] || exit 0
+
+PY=""; for c in python3 python py; do if "$c" -c '' >/dev/null 2>&1; then PY="$c"; break; fi; done
+[ -n "$PY" ] || exit 0
+
+printf '%s' "$hint" | "$PY" -c 'import json,sys
+print(json.dumps({"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"✦ baron: "+sys.stdin.read()}}))' 2>/dev/null || true
+exit 0

@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "baron-forge-marketplace",
+  "owner": { "name": "Baron", "url": "https://github.com/7ucg/baron-forge" },
+  "plugins": [
+    {
+      "name": "baron-forge",
+      "source": "./plugins/baron-forge",
+      "version": "2.0.0",
+      "description": "Operator-grade full-stack coder, debugger and reverse-engineering rig: smali/java/kotlin/dart/flutter/react/.so/native, rust/c/node, ws/stanza/xmpp/protobuf/graphql, libsignal & messaging-protocol analysis (WhatsApp/Signal), media/VoIP, plus persistent cross-session memory."
+    }
+  ]
+}

@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+# baron-mem — persistent cross-session memory for baron-forge
+# Global, project-independent. Plain markdown so it's human-editable.
+set -euo pipefail
+
+MEM_DIR="${BARON_FORGE_HOME:-$HOME/.claude/baron-forge}"
+MEM_FILE="$MEM_DIR/memory.md"
+mkdir -p "$MEM_DIR"
+[ -f "$MEM_FILE" ] || printf '# Baron Forge Memory\n\n' > "$MEM_FILE"
+
+ts() { date '+%Y-%m-%d %H:%M'; }
+
+# Resolve a working python (Windows ships a broken python3 app-exec alias).
+PY=""; for c in python3 python py; do if "$c" -c '' >/dev/null 2>&1; then PY="$c"; break; fi; done
+
+cmd="${1:-show}"; shift || true
+
+case "$cmd" in
+  save|add)
+    # baron-mem save "text"   (or pipe via stdin)
+    text="${*:-$(cat)}"
+    [ -n "$text" ] || { echo "nothing to save" >&2; exit 1; }
+    printf -- '- [%s] %s\n' "$(ts)" "$text" >> "$MEM_FILE"
+    echo "saved."
+    ;;
+  set)
+    # baron-mem set KEY "value"  — upsert a keyed fact
+    key="${1:?key}"; shift; val="$*"
+    tmp="$(mktemp)"
+    grep -v "^@${key}:" "$MEM_FILE" > "$tmp" || true
+    mv "$tmp" "$MEM_FILE"
+    printf '@%s: %s\n' "$key" "$val" >> "$MEM_FILE"
+    echo "set @$key."
+    ;;
+  get)
+    key="${1:?key}"
+    grep "^@${key}:" "$MEM_FILE" || { echo "no @$key" >&2; exit 1; }
+    ;;
+  show|load|cat)
+    cat "$MEM_FILE"
+    ;;
+  search|grep)
+    grep -i -- "${*:?pattern}" "$MEM_FILE" || { echo "no match" >&2; exit 1; }
+    ;;
+  edit)
+    "${EDITOR:-nano}" "$MEM_FILE"
+    ;;
+  path)
+    echo "$MEM_FILE"
+    ;;
+  clear)
+    printf '# Baron Forge Memory\n\n' > "$MEM_FILE"
+    echo "cleared."
+    ;;
+  hook-recall)
+    # UserPromptSubmit: turn counter + compact hint + memory recall.
+    body="$(cat)"
+    [ -n "$body" ] || exit 0
+
+    # Always count the turn in bash — no Python overhead, counter is always accurate.
+    _tf="${MEM_DIR}/session-turns"
+    _t=$(cat "$_tf" 2>/dev/null || echo 0)
+    _t=$((_t + 1))
+    printf '%s' "$_t" > "$_tf" 2>/dev/null || true
+
+    # Compact hint fires every 15 turns (15, 30, 45…).
+    _compact=""
+    [ $((_t % 15)) -eq 0 ] && [ "$_t" -gt 0 ] && \
+        _compact="[${_t} turns this session — /compact to summarize context and free tokens]"
+
+    # Short-prompt fast-path: skip recall but still emit compact hint if due.
+    if [ "${#body}" -le 120 ]; then
+        [ -n "$_compact" ] || exit 0
+        printf '%s' "$_compact" | "$PY" -c 'import json,sys
+h=sys.stdin.read()
+print(json.dumps({"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"<baron_forge_recall>\n"+h+"\n</baron_forge_recall>"}}))' 2>/dev/null || true
+        exit 0
+    fi
+
+    BARON_BODY="$body" COMPACT_HINT="$_compact" "$PY" - "$MEM_FILE" <<'PYEOF'
+import json, sys, re, os
+STOP = {
+    'that','this','with','from','have','been','will','what','when','where','which',
+    'your','more','some','very','also','just','into','than','then','them','they',
+    'their','here','about','after','before','does','each','every','first','good',
+    'help','keep','know','last','like','make','many','most','much','need','never',
+    'next','only','open','other','over','part','read','right','said','same','should',
+    'still','such','take','tell','there','these','those','time','turn','under',
+    'until','used','want','well','went','were','while','work','would','year',
+    'please','could','might','being','using','doing','show','look','find',
+    'dann','auch','noch','wenn','aber','oder','dass','sich','sind','wird','eine',
+    'einen','haben','schon','immer','alles','etwas','damit','jetzt','hier','kann',
+    'soll','muss','alle','nach','mehr','viel','bitte','erste','schau','macht',
+    'mach','gibt','geht','kein','keine','nicht','jede','jeden',
+}
+body = os.environ.get("BARON_BODY", "")
+compact_hint = os.environ.get("COMPACT_HINT", "")
+mem_file = sys.argv[1]
+try:
+    prompt = json.loads(body).get("prompt", "") or ""
+except Exception:
+    sys.exit(0)
+if len(prompt.split()) < 4:
+    # Even for short prompts, emit compact hint if due.
+    if not compact_hint:
+        sys.exit(0)
+    print(json.dumps({"hookSpecificOutput":{"hookEventName":"UserPromptSubmit",
+        "additionalContext":f"<baron_forge_recall>\n{compact_hint}\n</baron_forge_recall>"}}))
+    sys.exit(0)
+try:
+    mem = open(mem_file, encoding="utf-8").read()
+except Exception:
+    sys.exit(0)
+raw = set(re.findall(r"[a-z0-9_./-]{4,}", prompt.lower()))
+words = raw - STOP
+hits = []
+if words:
+    pat = "|".join(sorted(words)[:35])
+    hits = [ln for ln in mem.splitlines()
+            if not ln.strip().startswith("#") and re.search(pat, ln, re.I)][:15]
+if not hits and not compact_hint:
+    sys.exit(0)
+parts = ([compact_hint] if compact_hint else []) + hits
+print(json.dumps({
+    "hookSpecificOutput": {
+        "hookEventName": "UserPromptSubmit",
+        "additionalContext": "<baron_forge_recall>\n" + "\n".join(parts) + "\n</baron_forge_recall>"
+    }
+}))
+PYEOF
+    ;;
+  hook-inject)
+    # SessionStart: emit memory inject. Kept for backward compat; hook-session preferred.
+    body="$(cat "$MEM_FILE")"
+    if [ "$(printf '%s' "$body" | wc -l)" -le 2 ]; then exit 0; fi
+    esc="$(printf '%s' "$body" | "$PY" -c 'import json,sys; print(json.dumps(sys.stdin.read()))' 2>/dev/null || true)"
+    [ -n "$esc" ] || exit 0
+    printf '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"<baron_forge_memory>\\n%s\\n</baron_forge_memory>"}}' \
+      "$(printf '%s' "$body" | "$PY" -c 'import json,sys; print(json.dumps(sys.stdin.read())[1:-1])')"
+    ;;
+  hook-banner)
+    # SessionStart: confirm plugin + skills. Kept for backward compat; hook-session preferred.
+    SKILLS_DIR="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}/skills"
+    ver="$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1])).get("version","?"))' \
+      "${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}/.claude-plugin/plugin.json" 2>/dev/null || echo '?')"
+    skills="$(ls "$SKILLS_DIR" 2>/dev/null | sort | paste -sd, - | sed 's/,/, /g' || true)"
+    n="$(ls "$SKILLS_DIR" 2>/dev/null | wc -l | tr -d ' ')"
+    msg="baron-forge v${ver} loaded (global). ${n} skills available: ${skills}. At the start of your first reply this session, confirm to the user in one line that baron-forge and its ${n} skills are active."
+    printf '%s' "$msg" | "$PY" -c 'import json,sys
+print(json.dumps({"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"<baron_forge_loaded>\n"+sys.stdin.read()+"\n</baron_forge_loaded>"}}))' 2>/dev/null || true
+    ;;
+  hook-session)
+    # SessionStart: banner + memory + git status in a single Python call.
+    PLUGIN_DIR="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
+    # Reset session counters so they start fresh each session.
+    printf '0' > "$MEM_DIR/session-turns" 2>/dev/null || true
+    rm -f "$MEM_DIR/session-had-failure" 2>/dev/null || true
+    # Single git call for both branch name and dirty count (saves one subprocess).
+    _git_info="$(git status --branch --porcelain=v2 --untracked-files=no 2>/dev/null || true)"
+    _branch="$(printf '%s' "$_git_info" | awk '/^# branch\.head/{print $3}')"
+    _dirty="$(printf '%s' "$_git_info" | awk '/^[12]/{n++} END{print n+0}')"
+    if [ -n "$_branch" ]; then
+        GIT_LINE="git: $_branch"
+        [ "${_dirty:-0}" -gt 0 ] && GIT_LINE="$GIT_LINE | ${_dirty} changed"
+    else
+        GIT_LINE=""
+    fi
+    GIT_LINE="$GIT_LINE" "$PY" - "$PLUGIN_DIR/.claude-plugin/plugin.json" "$PLUGIN_DIR/skills" "$MEM_FILE" <<'PYEOF'
+import json, sys, os
+pjson_path, skills_dir, mem_file = sys.argv[1:]
+git_line = os.environ.get("GIT_LINE", "")
+try:
+    ver = json.load(open(pjson_path)).get("version", "?")
+except Exception:
+    ver = "?"
+try:
+    n = sum(
+        1 for d in os.listdir(skills_dir)
+        if os.path.isfile(os.path.join(skills_dir, d, "SKILL.md"))
+    )
+except Exception:
+    n = "?"
+git_part = f" | {git_line}" if git_line else ""
+banner = (f"baron-forge v{ver}{git_part}. {n} skills active. "
+          f"Confirm to the user in one line at session start.")
+try:
+    mem = open(mem_file, encoding="utf-8").read()
+    has_mem = mem.count("\n") > 2
+except Exception:
+    mem = ""; has_mem = False
+if has_mem:
+    ctx = (f"<baron_forge_loaded>\n{banner}\n</baron_forge_loaded>\n"
+           f"<baron_forge_memory>\n{mem}\n</baron_forge_memory>")
+else:
+    ctx = f"<baron_forge_loaded>\n{banner}\n</baron_forge_loaded>"
+print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}}))
+PYEOF
+    ;;
+  *)
+    cat >&2 <<EOF
+baron-mem <cmd>
+  show | load           print all memory
+  save "text"           append a timestamped note (or pipe stdin)
+  set KEY "value"       upsert a keyed fact (@KEY)
+  get KEY               read a keyed fact
+  search PATTERN        grep memory
+  edit                  open in \$EDITOR
+  path                  print memory file path
+  clear                 wipe memory
+  hook-inject           (internal) emit SessionStart context
+  hook-recall           (internal) emit prompt-relevant memory (UserPromptSubmit)
+EOF
+    exit 1
+    ;;
+esac

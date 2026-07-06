@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# baron-stack — UserPromptSubmit hook. When the prompt contains a stack trace,
+# extracts file:line references and injects them as baron_stack_refs so the model
+# can immediately read the right files without parsing the trace itself.
+set -uo pipefail
+
+input="$(cat)"
+[ -n "$input" ] || exit 0
+
+# Fast path: only spawn Python when trace-looking patterns are present.
+printf '%s' "$input" | grep -qE \
+  '(\-\-> [a-zA-Z0-9_./-]+\.[a-z]+:[0-9]+|at [a-zA-Z0-9_./-]+\.[a-z]+:[0-9]+|File ".+", line [0-9]+|#[0-9]+ .+\.[a-z]+:[0-9]+|thread .* panicked)' \
+  || exit 0
+
+PY=""; for c in python3 python py; do if "$c" -c '' >/dev/null 2>&1; then PY="$c"; break; fi; done
+[ -n "$PY" ] || exit 0
+
+BARON_BODY="$input" "$PY" - <<'PYEOF'
+import json, sys, re, os
+
+PATTERNS = [
+    r'-->\s*([\w./\\-]+\.[a-z]{1,6}):(\d+)',                    # Rust: --> src/file.rs:42
+    r'at\s+([\w./\\-]+\.[a-z]{1,6}):(\d+)',                     # Node/Dart: at file.ts:42
+    r'File\s+"([\w./\\-]+\.[a-z]{1,6})",\s*line\s+(\d+)',       # Python: File "x.py", line 42
+    r'#\d+\s+\S+\s+\(([\w./\\-]+\.[a-z]{1,6}):(\d+)',           # Dart: #0 method (file.dart:42
+    r'([\w./\\-]+\.[a-z]{1,6}):(\d+):\d+.*(?:error|warning)',   # Generic: file.rs:42:5 error
+]
+
+SKIP_PREFIXES = ('http', '/usr/', '/lib/', '/proc/', 'C:\\Windows', '/home/runner', '<')
+
+body = os.environ.get("BARON_BODY", "")
+try:
+    prompt = json.loads(body).get("prompt", "") or ""
+except Exception:
+    sys.exit(0)
+
+refs, seen = [], set()
+for pat in PATTERNS:
+    for m in re.finditer(pat, prompt):
+        fp, line = m.group(1), m.group(2)
+        if any(fp.startswith(p) for p in SKIP_PREFIXES):
+            continue
+        key = f"{fp}:{line}"
+        if key not in seen and len(refs) < 8:
+            refs.append(key)
+            seen.add(key)
+
+if not refs:
+    sys.exit(0)
+
+print(json.dumps({
+    "hookSpecificOutput": {
+        "hookEventName": "UserPromptSubmit",
+        "additionalContext": "<baron_stack_refs>\n" + "\n".join(refs) + "\n</baron_stack_refs>"
+    }
+}))
+PYEOF

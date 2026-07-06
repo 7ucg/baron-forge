@@ -1,0 +1,10 @@
+{
+  "name": "baron-forge",
+  "displayName": "Baron Forge",
+  "version": "2.0.0",
+  "description": "Operator-grade full-stack coder, debugger and reverse-engineering rig: smali/java/kotlin/dart/flutter/react/.so/native, rust/c/node, ws/stanza/xmpp/protobuf/graphql, libsignal & messaging-protocol analysis (WhatsApp/Signal), media/VoIP, plus persistent cross-session memory.",
+  "author": { "name": "Baron", "url": "https://github.com/7ucg" },
+  "homepage": "https://github.com/7ucg/baron-forge",
+  "repository": "https://github.com/7ucg/baron-forge",
+  "keywords": ["reverse-engineering", "fullstack", "debugger", "protocol", "libsignal", "whatsapp", "signal", "memory", "smali", "rust", "compact", "token-efficiency", "humanizer", "commit-work", "ship-learn-next", "mermaid", "dependency-updater", "readme", "database-schema", "qa-test-planner", "plugin-forge", "skill-judge"]
+}

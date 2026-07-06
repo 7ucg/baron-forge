@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# baron-quality — auto-format/lint the file just edited (PostToolUse hook).
+# Reads PostToolUse hook JSON on stdin, formats by extension if the tool exists,
+# and only feeds *errors* back to Claude. Never blocks.
+set -uo pipefail
+
+PY=""; for c in python3 python py; do if "$c" -c '' >/dev/null 2>&1; then PY="$c"; break; fi; done
+[ -n "$PY" ] || exit 0
+
+input="$(cat)"
+fp="$(printf '%s' "$input" | "$PY" -c 'import json,sys
+try:
+    d=json.load(sys.stdin); ti=d.get("tool_input",{})
+    print(ti.get("file_path") or ti.get("path") or "")
+except Exception:
+    print("")' 2>/dev/null || true)"
+
+fp="${fp//\\//}"   # normalize Windows backslash paths for git-bash
+[ -n "$fp" ] && [ -f "$fp" ] || exit 0
+have(){ command -v "$1" >/dev/null 2>&1; }
+err=""
+
+case "$fp" in
+  *.rs)
+    have rustfmt && err="$(rustfmt --edition 2021 "$fp" 2>&1 || true)" ;;
+  *.ts|*.tsx|*.js|*.jsx|*.mjs|*.cjs|*.json|*.css|*.scss|*.html|*.yaml|*.yml)
+    if have prettier; then err="$(prettier --write "$fp" 2>&1 || true)"
+    elif have npx && npx --no-install prettier --version >/dev/null 2>&1; then err="$(npx --no-install prettier --write "$fp" 2>&1 || true)"; fi ;;
+  *.py)
+    if have ruff; then ruff format "$fp" >/dev/null 2>&1 || true; err="$(ruff check --fix "$fp" 2>&1 || true)"
+    elif have black; then err="$(black -q "$fp" 2>&1 || true)"; fi ;;
+  *.kt|*.kts)
+    have ktlint && err="$(ktlint -F "$fp" 2>&1 || true)" ;;
+  *.dart)
+    have dart && err="$(dart format "$fp" 2>&1 || true)" ;;
+  *.go)
+    have gofmt && gofmt -w "$fp" 2>/dev/null || true ;;
+  *.sh)
+    have shfmt && shfmt -w "$fp" 2>/dev/null || true ;;
+  *) exit 0 ;;
+esac
+
+# Surface only genuine problems, not "formatted N files" noise.
+if [ -n "$err" ] && printf '%s' "$err" | grep -qiE 'error|warning|panic|✗|unresolved|cannot'; then
+  printf '%s' "$err" | FP="$fp" "$PY" -c 'import json,sys,os
+m=sys.stdin.read()[:1500]
+print(json.dumps({"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"⚠ baron-quality "+os.environ.get("FP","")+":\n"+m}}))' 2>/dev/null || true
+fi
+
+# Brain stale marker: if a key project config was just written, flag brain as outdated.
+case "$fp" in
+  */Cargo.toml|*/package.json|*/pubspec.yaml|*/go.mod|*/pyproject.toml|*/build.gradle)
+    _root="$(git -C "$(dirname "$fp")" rev-parse --show-toplevel 2>/dev/null || true)"
+    [ -n "$_root" ] && touch "$_root/.baron-brain-stale" 2>/dev/null || true
+    ;;
+esac
+
+exit 0
